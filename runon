@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -e
+
+function print_help {
+  echo "To run a command on K8s node:      runon [node IP] command [command to run]"
+  echo "To start wireshark debugging:      runon [node IP] capture [interface]"
+  echo "To run perf and get a Flame Graph: runon [node IP] perf [measurement time in seconds, defaults to 10]"
+  exit 1
+}
+
+function check_kubectl_jq {
+  command -v kubectl >/dev/null 2>&1 || { echo >&2 "I require kubectl but it's not installed. Aborting."; exit 2; }
+  command -v jq >/dev/null 2>&1 || { echo >&2 "I require jq but it's not installed. Aborting."; exit 3; }
+}
+
+function check_wireshark {
+  command -v wireshark >/dev/null 2>&1 || { echo >&2 " I require wireshark but it's not installed. Aborting."; }
+}
+
+function cleanup {
+  kubectl get job ${JOB_NAME} -n${NAMESPACE} &>/dev/null && kubectl delete job ${JOB_NAME} -n${NAMESPACE}
+}
+
+function pod_status {
+  kubectl get pods $1 -n ${NAMESPACE} -o json | jq -r '.status.conditions[] | select(.type == "Ready") | .status '
+}
+
+trap cleanup SIGSTOP SIGHUP SIGINT SIGQUIT ERR EXIT
+
+if [[ $# -gt 0 ]]
+then
+  NODE="$1"
+  shift
+  ARG="$1"
+  case $ARG in
+    command)
+      check_kubectl_jq
+      MODE="command"
+      shift
+      if [ "$1" == "--" ]; then
+        shift
+      fi
+      COMMAND="$@";;
+    capture)
+      check_kubectl_jq
+      check_wireshark
+      MODE="capture"
+      INTERFACE=$2;;
+    perf)
+      check_kubectl_jq
+      MODE="perf"
+      PERF_TIME=${2:-'10'};;
+    *)
+      print_help;;
+  esac
+fi
+
+# create a random pod name
+JOB_NAME="runon-$(LC_CTYPE=C cat /dev/urandom | base64 | tr -dc a-z0-9 | fold -w 26 | head -n 1)"
+NAMESPACE="ibm-system"
+
+(cat << EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: runon-shell
+spec:
+  template:
+    spec:
+      tolerations:
+        - operator: "Exists"
+      nodeSelector:
+        kubernetes.io/hostname: ${NODE}
+      containers:
+        - name: runon
+          image: "alpine:3.10"
+          command:
+            - sleep
+            - 8h
+          securityContext:
+            privileged: true
+      hostPID: true
+      hostNetwork: true
+      restartPolicy: Never
+EOF
+) | if ! kubectl create -f - 2>&1 > /dev/null; then
+  echo "unable to create job, bailing out"
+  exit 1
+fi
+
+# get the uid
+ID=$(kubectl get job ${JOB_NAME} -n ${NAMESPACE} -o 'jsonpath={.metadata.uid}')
+if [ -z "${ID}" ]; then
+  echo "ERR unable to get job id"
+  exit 1
+fi
+
+
+POD=$(kubectl get pods -n ${NAMESPACE} -l controller-uid=${ID},job-name=${JOB_NAME} -o 'jsonpath={.items[].metadata.name}')
+
+SUCCESS=""
+current_time=$(date +%s)
+stop_time=$((current_time + 60)) # this shouldn't take that long, give it 60 seconds
+
+status=$(pod_status ${POD})
+while [[ $current_time -lt $stop_time ]]; do
+  if [ "${status}" = "True" ]; then
+    SUCCESS=true
+    break
+  else
+    sleep 1
+  fi
+  status=$(pod_status ${POD})
+done
+
+if [ "${SUCCESS}" = "true" ]; then
+  case $MODE in
+    command)
+      kubectl exec -it "${POD}" -n ${NAMESPACE} -- nsenter -t 1 -m -u -i -n -p -- $@ <&0 2>&1
+      ;;
+    capture)
+      wireshark -k -i <(kubectl exec -t "${POD}" -n ${NAMESPACE} -- sh -c 'apk add --update tcpdump &>/dev/null; nsenter -t 1 -m -u -i -n -p -- tcpdump -i '${INTERFACE}' -U -s 0 -w - | cat 2>/dev/null')
+      ;;
+    perf)
+      FILENAME="/tmp/perf.svg"
+      URI="file://${FILENAME}"
+
+      echo "Running perf for ${PERF_TIME} seconds, please wait. The result will be displayed automatically."
+
+      echo 'apk add git perl coreutils
+
+echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositories && \
+echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories && \
+echo "http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories && \
+apk update && \
+apk add perf
+
+git clone https://github.com/brendangregg/FlameGraph
+
+perf record -ag -F 999 -- sleep ${PERF_TIME}
+perf script | ./FlameGraph/stackcollapse-perf.pl > out.perf-folded
+./FlameGraph/flamegraph.pl out.perf-folded > perf.svg' > /tmp/runon-perf
+
+      kubectl cp -n ${NAMESPACE} /tmp/runon-perf ${POD}:/perf
+      rm -f /tmp/runon-perf
+
+      kubectl exec -it "${POD}" -n ${NAMESPACE} -- sh /perf 1>/dev/null
+      kubectl exec -it "${POD}" -n ${NAMESPACE} -- cat perf.svg > $FILENAME
+
+      echo "Attempting to open the result in a web browser: ${URI}"
+      failed_to_open="false"
+      case $OSTYPE in
+        "darwin"*)
+          open -a firefox "${URI}" || \
+          open -a "Google Chrome" "${URI}" || \
+          open -a safari "${URI}" || \
+          failed_to_open="true"
+          ;;
+        "linux-gnu")
+          if [ -x "$(command -v firefox)" ]; then
+            firefox "${URI}"
+          elif [ -x "$(command -v chromium-browser)" ]; then
+            chromium-browser "${URI}"
+          else
+            failed_to_open="true"
+          fi
+          ;;
+        *)
+          failed_to_open="true"
+          ;;
+      esac
+      if [ "${failed_to_open}" = "true" ]; then
+        echo "Failed to find a web browser. Please open the link manually."
+      fi
+      ;;
+  esac
+else
+  echo "failed pod wasn't ready in time"
+  exit 1
+fi

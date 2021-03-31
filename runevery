@@ -1,0 +1,98 @@
+#!/bin/bash
+
+if [ $# -lt 1 ]; then
+  echo "runevery command arg..."
+  exit 1;
+fi
+
+COMMAND=$@
+
+NAMESPACE="ibm-system"
+
+SRCTIME="$(date +%y%m%d-%H%M%S)"
+LOGFILE="/tmp/pod/from-$(hostname)-at-${SRCTIME}"
+
+# create a random name
+DS_NAME=$(LC_CTYPE=C cat /dev/urandom | base64 | tr -dc a-z0-9 | fold -w 32 | head -n 1)
+
+(cat << EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ${DS_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: runevery
+  annotations:
+    client: "$(hostname)"
+    srctime: "${SRCTIME}"
+    logfile: "${LOGFILE}"
+spec:
+  selector:
+    matchLabels:
+      app: runevery
+      runevery: ${DS_NAME}
+  template:
+    metadata:
+      labels:
+        app: runevery
+        runevery: ${DS_NAME}
+      annotations:
+        client: "$(hostname)"
+        srctime: "${SRCTIME}"
+        logfile: "${LOGFILE}"
+    spec:
+      tolerations:
+      - operator: "Exists"
+      initContainers:
+      - name: doit
+        image: "alpine:3.9"
+        command:
+          - sh
+          - -c
+          - touch ${LOGFILE} ; nsenter -t 1 -m -u -i -n -p -- sh -c "${COMMAND}" >> ${LOGFILE}
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: tmp-pod
+          mountPath: /tmp/pod
+      containers:
+      - name: tarry
+        image: "alpine:3.9"
+        command:
+          - sh
+          - -c
+          - while true; do sleep 15; done
+        volumeMounts:
+        - name: tmp-pod
+          mountPath: /tmp/pod
+      hostPID: true
+      hostNetwork: true
+      volumes:
+      - name: tmp-pod
+        emptyDir: {}
+EOF
+) | if ! kubectl create -f - 2>&1 > /dev/null; then
+  echo "unable to create DaemonSet, bailing out"
+  exit 1
+fi
+
+echo "set=$DS_NAME srctime=$SRCTIME logfile=$LOGFILE command=${COMMAND}"
+
+while true; do
+	if tst=$(kubectl -n $NAMESPACE get ds $DS_NAME -o jsonpath='{.status.desiredNumberScheduled}{"\t"}{.status.numberAvailable}'); then
+		desired=$(cut <<<"$tst" -f1)
+		available=$(cut <<<"$tst" -f2)
+		echo "desired=$desired available=$available"
+		if [ -n "$desired" -a -n "$available" ]; then
+			if [ "$desired" -eq "$available" ]; then break; fi
+		fi
+	fi
+	sleep 10
+done
+
+kubectl -n $NAMESPACE get Pod -l app=runevery -l runevery=$DS_NAME -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' | sort -k2 | while read podname nodename; do
+	echo -n "At $nodename: "
+	kubectl -n $NAMESPACE exec $podname -c tarry cat "$LOGFILE"
+	echo
+done
